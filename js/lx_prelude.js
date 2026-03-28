@@ -1,0 +1,249 @@
+// lx_prelude.js - globalThis.lx object definition
+// This script is executed before user scripts to set up the lx environment.
+// It relies on Go-layer polyfills: fetch, crypto, zlib, Buffer, console, setTimeout, etc.
+//
+// Reference: plugins/mimusic-plugin-lxmusic/lxserver/src/server/userApi.ts
+
+'use strict';
+
+// Event handler registry (mirrors Node.js eventHandlers Map)
+var _eventHandlers = new Map();
+
+// Registered sources from script's lx.send('inited', {sources})
+var _registeredSources = {};
+
+// Script metadata (populated by Go side before script execution)
+var _scriptInfo = {
+    name: '',
+    description: '',
+    version: '',
+    author: '',
+    homepage: '',
+    rawScript: ''
+};
+
+globalThis.lx = {
+    version: '2.0.0',
+    env: 'desktop',
+    platform: 'web',
+    currentScriptInfo: _scriptInfo,
+
+    EVENT_NAMES: {
+        request: 'request',
+        inited: 'inited',
+        updateAlert: 'updateAlert'
+    },
+
+    // Utility functions wrapping Go-layer polyfills
+    utils: {
+        buffer: {
+            from: function(data, encoding) {
+                return Buffer.from(data, encoding);
+            },
+            bufToString: function(buf, format) {
+                if (typeof buf === 'object' && buf !== null && typeof buf.toString === 'function') {
+                    return buf.toString(format || 'utf8');
+                }
+                return Buffer.from(buf, 'binary').toString(format || 'utf8');
+            }
+        },
+        crypto: {
+            md5: function(str) {
+                return crypto.md5(str || '');
+            },
+            aesEncrypt: function(buffer, mode, key, iv) {
+                return crypto.aesEncrypt(buffer, mode, key, iv);
+            },
+            rsaEncrypt: function(buffer, key) {
+                return crypto.rsaEncrypt(buffer, key);
+            },
+            randomBytes: function(size) {
+                return crypto.randomBytes(size);
+            }
+        },
+        zlib: {
+            inflate: function(buffer) {
+                return zlib.inflate(buffer);
+            },
+            deflate: function(buffer) {
+                return zlib.deflate(buffer);
+            }
+        }
+    },
+
+    // HTTP request — callback-style API matching LX Music Desktop's lx.request
+    // Signature: lx.request(url, options, callback)
+    //   callback(error, response, body)
+    //   response = { statusCode, statusMessage, headers, body }
+    // Returns a cancel function.
+    request: function(url, options, callback) {
+        if (typeof options === 'function') {
+            callback = options;
+            options = {};
+        }
+        options = options || {};
+
+        var method = (options.method || 'GET').toUpperCase();
+        var timeout = (typeof options.timeout === 'number' && options.timeout > 0)
+            ? Math.min(options.timeout, 60000)
+            : 60000;
+        var headers = options.headers || {};
+
+        // Determine body: support body, form, formData
+        var bodyContent = options.body || null;
+        if (options.form) {
+            bodyContent = options.form;
+            if (typeof bodyContent === 'object') {
+                var parts = [];
+                var formKeys = Object.keys(bodyContent);
+                for (var fi = 0; fi < formKeys.length; fi++) {
+                    parts.push(encodeURIComponent(formKeys[fi]) + '=' + encodeURIComponent(bodyContent[formKeys[fi]]));
+                }
+                bodyContent = parts.join('&');
+                if (!headers['Content-Type'] && !headers['content-type']) {
+                    headers['Content-Type'] = 'application/x-www-form-urlencoded';
+                }
+            }
+        } else if (options.formData) {
+            bodyContent = options.formData;
+        }
+
+        // If body is an object (not string), JSON-stringify it
+        if (bodyContent !== null && typeof bodyContent === 'object') {
+            bodyContent = JSON.stringify(bodyContent);
+            if (!headers['Content-Type'] && !headers['content-type']) {
+                headers['Content-Type'] = 'application/json';
+            }
+        }
+
+        var aborted = false;
+        var abortController = null;
+
+        var fetchOptions = {
+            method: method,
+            headers: headers
+        };
+        if (bodyContent) {
+            fetchOptions.body = bodyContent;
+        }
+
+        fetch(url, fetchOptions).then(function(resp) {
+            if (aborted) return;
+            return resp.text().then(function(bodyText) {
+                if (aborted) return;
+
+                // Try to parse body as JSON (matching needle behavior)
+                var parsedBody = bodyText;
+                try {
+                    parsedBody = JSON.parse(bodyText);
+                } catch (parseError) {
+                    // Keep as string
+                }
+
+                var response = {
+                    statusCode: resp.status,
+                    statusMessage: resp.statusText || '',
+                    headers: resp.headers || {},
+                    body: parsedBody
+                };
+
+                if (typeof callback === 'function') {
+                    callback(null, response, parsedBody);
+                }
+            });
+        }).catch(function(err) {
+            if (aborted) return;
+            if (typeof callback === 'function') {
+                var errMsg = (err && err.message) ? err.message : String(err);
+                callback(new Error(errMsg), null, null);
+            }
+        });
+
+        // Return cancel function
+        return function() {
+            aborted = true;
+        };
+    },
+
+    // Send event to Go side via __goqjs_send bridge function
+    send: function(eventName, data) {
+        if (eventName === 'inited') {
+            if (data && data.sources) {
+                _registeredSources = data.sources;
+            }
+        }
+        if (typeof __goqjs_send === 'function') {
+            __goqjs_send(eventName, JSON.stringify(data));
+        }
+    },
+
+    // Register event handler
+    on: function(eventName, handler) {
+        _eventHandlers.set(eventName, handler);
+    },
+
+    // Dispatch event to registered handler (called from Go side via dispatch request).
+    // The handler may return a Promise; the resolved/rejected value is sent back
+    // to Go via __goqjs_send('dispatchResult', ...) / __goqjs_send('dispatchError', ...).
+    _dispatch: function(requestId, eventName, data) {
+        var handler = _eventHandlers.get(eventName);
+        if (typeof handler !== 'function') {
+            if (typeof __goqjs_send === 'function') {
+                __goqjs_send('dispatchError', JSON.stringify({
+                    id: requestId,
+                    error: 'No handler registered for event: ' + eventName
+                }));
+            }
+            return;
+        }
+
+        try {
+            var result = handler(data);
+
+            // If handler returns a Promise (thenable), await it
+            if (result && typeof result.then === 'function') {
+                result.then(function(value) {
+                    if (typeof __goqjs_send === 'function') {
+                        __goqjs_send('dispatchResult', JSON.stringify({
+                            id: requestId,
+                            result: value
+                        }));
+                    }
+                }).catch(function(err) {
+                    if (typeof __goqjs_send === 'function') {
+                        var errMsg = (err && err.message) ? err.message : String(err);
+                        __goqjs_send('dispatchError', JSON.stringify({
+                            id: requestId,
+                            error: errMsg
+                        }));
+                    }
+                });
+            } else {
+                // Synchronous result
+                if (typeof __goqjs_send === 'function') {
+                    __goqjs_send('dispatchResult', JSON.stringify({
+                        id: requestId,
+                        result: result
+                    }));
+                }
+            }
+        } catch (err) {
+            if (typeof __goqjs_send === 'function') {
+                var errMsg = (err && err.message) ? err.message : String(err);
+                __goqjs_send('dispatchError', JSON.stringify({
+                    id: requestId,
+                    error: errMsg
+                }));
+            }
+        }
+    },
+
+    // Get registered sources (used by Go side after 'inited' event)
+    _getSources: function() {
+        return _registeredSources;
+    }
+};
+
+// Browser-like global aliases (needed by obfuscated scripts)
+globalThis.window = globalThis;
+globalThis.global = globalThis;
