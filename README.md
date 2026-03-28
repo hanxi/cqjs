@@ -18,6 +18,9 @@
 cqjs/
 ├── main.c              # 主程序（事件循环、JSON Lines 协议、dispatch tracker）
 ├── cqjs.h              # 公共头文件（类型定义、函数声明）
+├── env_manager.h/c     # 多环境管理器（环境创建/销毁/请求队列/事件循环）
+├── cqjs.h/c            # 公共工具函数（JSON 响应、文件 I/O、时间、dispatch tracker、big-stack eval/call）
+├── bytecode_cache.h/c  # JS 字节码缓存（避免重复编译）
 ├── Makefile             # 构建脚本
 ├── quickjs/             # QuickJS-ng 源码（amalgamated）
 ├── polyfill/            # Web API Polyfill（纯 C 实现）
@@ -30,6 +33,12 @@ cqjs/
 │   ├── encoding.c       # TextEncoder/TextDecoder
 │   ├── url.c            # URL/URLSearchParams
 │   └── zlib.c           # zlib.inflate/deflate
+├── go/                  # Go SDK（通过 JSON Lines 协议与 cqjs 子进程交互）
+│   ├── cqjs.go          # Server 封装（NewServer、Eval、SendRequest 等）
+│   ├── types.go         # Request/Response/Event 类型定义
+│   ├── cqjs_test.go     # Go 测试用例
+│   ├── cmd/example_callmusicurl/  # callMusicUrl 可运行示例
+│   └── go.mod           # Go 模块定义
 ├── js/
 │   └── lx_prelude.js    # globalThis.lx 对象定义
 ├── test_lxsource.sh     # 洛雪音乐源加载测试
@@ -152,15 +161,126 @@ echo '{"id":"1","type":"eval_file","path":"script.js"}' | ./cqjs
 | Web API Polyfill | Go 实现 | C 实现 |
 | 栈溢出保护 | 64MB pthread | 64MB pthread |
 
+## Go SDK
+
+`cqjs/go` 提供了 Go 语言封装，通过 JSON Lines 协议与 cqjs 子进程交互。
+
+### 安装
+
+```bash
+go get github.com/hanxi/cqjs/go
+```
+
+### 基本用法
+
+```go
+package main
+
+import (
+	"fmt"
+	"log"
+
+	cqjs "github.com/hanxi/cqjs/go"
+)
+
+func main() {
+	// 启动 cqjs 子进程
+	server, err := cqjs.NewServer("./cqjs")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer server.Close()
+
+	// 创建 JS 环境
+	err = server.CreateEnv("my_env", cqjs.WithInitCode("var x = 42;"))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// 执行 JS 代码
+	resp, err := server.Eval("my_env", "x + 1")
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(resp.ValueString()) // "43"
+
+	// 销毁环境
+	server.DestroyEnv("my_env")
+}
+```
+
+### callMusicUrl 示例
+
+通过 `SendRequest` 构建任意请求类型（完整可运行示例见 `go/cmd/example_callmusicurl/main.go`）：
+
+```bash
+# 运行示例
+cd go && go run ./cmd/example_callmusicurl -bin ../cqjs -script path/to/lx-music-source.js
+```
+
+```go
+// 1. 加载洛雪音乐源脚本
+loadResp, err := server.SendRequest(&cqjs.Request{
+	Type: "eval_file",
+	Path: "path/to/lx-music-source.js",
+}, 30*time.Second)
+
+// 2. 等待 inited 事件
+evt := <-server.Events()
+fmt.Printf("event: %s\n", evt.Name)
+
+// 3. 调用 callMusicUrl 获取播放 URL
+songInfo := `{"name":"晴天","singer":"周杰伦","songmid":"228908","rid":"228908"}`
+resp, err := server.SendRequest(&cqjs.Request{
+	Type:     "callMusicUrl",
+	Source:   "kw",
+	SongInfo: songInfo,
+	Quality:  "128k",
+}, 60*time.Second)
+fmt.Println("播放 URL:", resp.ValueString())
+```
+
+### API 列表
+
+| 方法 | 说明 |
+|------|------|
+| `NewServer(binPath)` | 启动 cqjs 子进程 |
+| `Close()` | 关闭子进程 |
+| `CreateEnv(envID, opts...)` | 创建 JS 环境 |
+| `DestroyEnv(envID)` | 销毁 JS 环境 |
+| `ListEnvs()` | 列出所有环境 |
+| `Eval(envID, code)` | 在指定环境执行 JS |
+| `EvalWithTimeout(envID, code, timeout)` | 带超时执行 JS |
+| `SendRequest(req, timeout)` | 发送任意类型请求（eval_file、dispatch、callMusicUrl 等） |
+| `Events()` | 获取事件通道 |
+
+### 环境选项
+
+| 选项 | 说明 |
+|------|------|
+| `WithInitCode(code)` | 环境初始化代码 |
+| `WithMemoryLimit(mb)` | 内存限制（MB） |
+| `WithStackSize(mb)` | 栈大小（MB） |
+
 ## 测试
 
 ```bash
-# 测试加载洛雪音乐源脚本
-bash test_lxsource.sh
+# Shell 测试
+bash test_lxsource.sh       # 测试加载洛雪音乐源脚本
+bash test_callMusicUrl.sh    # 测试 callMusicUrl 端到端
 
-# 测试 callMusicUrl 端到端
-bash test_callMusicUrl.sh
+# Go SDK 测试（需要先编译 cqjs）
+cd cqjs && make              # 编译 cqjs 二进制
+cd go && go test -v ./...    # 运行 Go 测试
+# 或指定 cqjs 二进制路径
+CQJS_BIN=/path/to/cqjs go test -v ./...
 ```
+
+## 架构说明
+
+- **多环境模型**: 每个 JS 环境拥有独立的 `JSRuntime` + `JSContext` + pthread 事件循环线程
+- **环境上限**: 最多 64 个并发环境（`MAX_ENVIRONMENTS`），防止线程资源耗尽
+- **线程安全**: 请求通过 `notify_pipe` + `poll()` 提交到环境线程，无锁竞争
 
 ## 许可证
 

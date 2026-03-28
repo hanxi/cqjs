@@ -142,6 +142,23 @@ int fm_has_pending(fetch_manager_t *fm);
 void fm_free(fetch_manager_t *fm, JSContext *ctx);
 
 /* ============================================================
+ * JSON response helpers
+ * ============================================================ */
+
+/* Escape a C string to JSON string (with quotes). Caller must free(). */
+char *json_escape_string(const char *str);
+
+/* Build and send a JSON response via cqjs_send_response().
+ * All pointer params can be NULL to omit the field.
+ * value_is_raw: if 1, value is already a JSON string (no extra quoting).
+ * data_is_raw: if 1, data is already a JSON string (no extra quoting). */
+void send_json_response(const char *id, const char *type,
+                        const char *env_id,
+                        const char *value, int value_is_raw,
+                        const char *message,
+                        const char *name, const char *data, int data_is_raw);
+
+/* ============================================================
  * 64MB big-stack pthread helpers
  * ============================================================ */
 

@@ -30,7 +30,7 @@ QUICKJS_SRCS = quickjs/quickjs.c quickjs/dtoa.c quickjs/libregexp.c quickjs/libu
 POLYFILL_SRCS = polyfill/polyfill.c polyfill/console.c polyfill/fetch.c \
                 polyfill/timer.c polyfill/crypto.c polyfill/buffer.c \
                 polyfill/encoding.c polyfill/url.c polyfill/zlib.c
-MAIN_SRCS = main.c
+MAIN_SRCS = main.c cqjs.c env_manager.c bytecode_cache.c
 
 SRCS = $(MAIN_SRCS) $(QUICKJS_SRCS) $(POLYFILL_SRCS)
 OBJS = $(SRCS:.c=.o)
