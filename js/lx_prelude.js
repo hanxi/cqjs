@@ -117,7 +117,7 @@ globalThis.lx = {
         }
 
         var aborted = false;
-        var abortController = null;
+        var callbackCalled = false;
 
         var fetchOptions = {
             method: method,
@@ -127,11 +127,24 @@ globalThis.lx = {
             fetchOptions.body = bodyContent;
         }
 
+        function safeCallback(err, response, body) {
+            if (callbackCalled || aborted) return;
+            callbackCalled = true;
+            if (typeof callback === 'function') {
+                try {
+                    callback(err, response, body);
+                } catch (callbackError) {
+                    console.error('[lx.request] callback threw:', callbackError);
+                }
+            }
+        }
+
         fetch(url, fetchOptions).then(function(resp) {
             if (aborted) return;
+            console.error('[lx.request] fetch resolved, status=' + resp.status + ' url=' + url.substring(0, 100));
             return resp.text().then(function(bodyText) {
                 if (aborted) return;
-
+                console.error('[lx.request] resp.text() resolved, bodyLen=' + (bodyText ? bodyText.length : 0));
                 // Try to parse body as JSON (matching needle behavior)
                 var parsedBody = bodyText;
                 try {
@@ -147,16 +160,15 @@ globalThis.lx = {
                     body: parsedBody
                 };
 
-                if (typeof callback === 'function') {
-                    callback(null, response, parsedBody);
-                }
+                console.error('[lx.request] calling safeCallback, statusCode=' + response.statusCode);
+                safeCallback(null, response, parsedBody);
+                console.error('[lx.request] safeCallback returned');
             });
         }).catch(function(err) {
             if (aborted) return;
-            if (typeof callback === 'function') {
-                var errMsg = (err && err.message) ? err.message : String(err);
-                callback(new Error(errMsg), null, null);
-            }
+            var errMsg = (err && err.message) ? err.message : String(err);
+            console.error('[lx.request] fetch/text catch: ' + errMsg);
+            safeCallback(new Error(errMsg), null, null);
         });
 
         // Return cancel function
@@ -203,6 +215,7 @@ globalThis.lx = {
         function sendResult(value) {
             if (settled) return;
             settled = true;
+            console.error('[_dispatch] sendResult called, requestId=' + requestId + ' value=' + (typeof value === 'string' ? value.substring(0, 200) : String(value)));
             if (typeof __cqjs_send === 'function') {
                 __cqjs_send('dispatchResult', JSON.stringify({
                     id: requestId,
@@ -214,8 +227,9 @@ globalThis.lx = {
         function sendError(err) {
             if (settled) return;
             settled = true;
+            var errMsg = (err && err.message) ? err.message : String(err);
+            console.error('[_dispatch] sendError called, requestId=' + requestId + ' error=' + errMsg);
             if (typeof __cqjs_send === 'function') {
-                var errMsg = (err && err.message) ? err.message : String(err);
                 __cqjs_send('dispatchError', JSON.stringify({
                     id: requestId,
                     error: errMsg
@@ -226,18 +240,20 @@ globalThis.lx = {
         try {
             var result = handler(data);
             var isThenable = (result && typeof result.then === 'function');
+            console.error('[_dispatch] handler returned, isThenable=' + isThenable + ' requestId=' + requestId);
 
             if (isThenable) {
-                // Guard against Promises that never settle (e.g. script bug on HTTP error)
-                // 8s is chosen to allow retries within the 30s WASM callback timeout
                 var timeoutId = setTimeout(function() {
-                    sendError(new Error('dispatch timeout: handler Promise did not settle within 8s'));
-                }, 8000);
+                    console.error('[_dispatch] TIMEOUT fired, settled=' + settled + ' requestId=' + requestId);
+                    sendError(new Error('dispatch timeout: handler Promise did not settle within 18s'));
+                }, 18000);
 
                 result.then(function(value) {
+                    console.error('[_dispatch] Promise resolved, requestId=' + requestId);
                     clearTimeout(timeoutId);
                     sendResult(value);
-                }).catch(function(err) {
+                }, function(err) {
+                    console.error('[_dispatch] Promise rejected, requestId=' + requestId);
                     clearTimeout(timeoutId);
                     sendError(err);
                 });
