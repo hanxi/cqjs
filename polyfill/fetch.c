@@ -126,6 +126,7 @@ static void *fetch_worker_wrapper(void *arg) {
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "cqjs/1.0");
+    curl_easy_setopt(curl, CURLOPT_PROXY, "");  /* use http_proxy/https_proxy/ALL_PROXY env vars */
 
     if (entry->method) {
         if (strcmp(entry->method, "POST") == 0) {
