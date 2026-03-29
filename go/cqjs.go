@@ -246,6 +246,8 @@ func (s *Server) sendRaw(req *Request) error {
 	}
 	data = append(data, '\n')
 
+	fmt.Fprintf(os.Stderr, "[cqjs-go] sendRaw: type=%s env_id=%s data_len=%d\n", req.Type, req.EnvID, len(data))
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

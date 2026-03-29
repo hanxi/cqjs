@@ -98,8 +98,14 @@ static void *fetch_worker_wrapper(void *arg) {
     int notify_fd = wa->notify_fd;
     free(wa);
 
+    fprintf(stderr, "[DEBUG] fetch_worker: starting request method=%s url=%s\n",
+            entry->method ? entry->method : "GET", entry->url);
+    fflush(stderr);
+
     CURL *curl = curl_easy_init();
     if (!curl) {
+        fprintf(stderr, "[DEBUG] fetch_worker: curl_easy_init failed url=%s\n", entry->url);
+        fflush(stderr);
         entry->is_error = 1;
         entry->error_msg = strdup("fetch: curl_easy_init failed");
         entry->completed = 1;
@@ -152,6 +158,9 @@ static void *fetch_worker_wrapper(void *arg) {
     CURLcode res = curl_easy_perform(curl);
 
     if (res != CURLE_OK) {
+        fprintf(stderr, "[DEBUG] fetch_worker: curl error url=%s code=%d err=%s\n",
+                entry->url, (int)res, curl_easy_strerror(res));
+        fflush(stderr);
         entry->is_error = 1;
         char errmsg[256];
         snprintf(errmsg, sizeof(errmsg), "fetch error: %s", curl_easy_strerror(res));
@@ -160,6 +169,14 @@ static void *fetch_worker_wrapper(void *arg) {
         long status;
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
         entry->status_code = (int)status;
+
+        fprintf(stderr, "[DEBUG] fetch_worker: success url=%s status=%ld body_len=%zu\n",
+                entry->url, status, body_buf.len);
+        // 打印 body 内容
+        for (size_t i = 0; i < body_buf.len; i++) {
+            fprintf(stderr, "%c", body_buf.data[i]);
+        }
+        fflush(stderr);
 
         char status_text[64];
         snprintf(status_text, sizeof(status_text), "%d", (int)status);
@@ -368,11 +385,28 @@ int fm_process_pending(fetch_manager_t *fm, JSContext *ctx) {
         return 0;
     }
 
+    fprintf(stderr, "[DEBUG] fm_process_pending: has entries, checking completion\n");
+    fflush(stderr);
+
+    /* Log all pending entries for debugging */
+    {
+        fetch_entry_t *dbg = fm->head;
+        while (dbg) {
+            fprintf(stderr, "[DEBUG] fm_process_pending: entry url=%s completed=%d is_error=%d\n",
+                    dbg->url, dbg->completed, dbg->is_error);
+            dbg = dbg->next;
+        }
+        fflush(stderr);
+    }
+
     int processed = 0;
     fetch_entry_t **pp = &fm->head;
     while (*pp) {
         fetch_entry_t *e = *pp;
         if (e->completed) {
+            fprintf(stderr, "[DEBUG] fm_process_pending: fetch completed url=%s is_error=%d status=%d\n",
+                    e->url, e->is_error, e->status_code);
+            fflush(stderr);
             *pp = e->next;
             pthread_mutex_unlock(&fm->mutex);
 
@@ -564,6 +598,10 @@ static JSValue js_fetch(JSContext *ctx, JSValueConst this_val,
     entry->completed = 0;
 
     JS_FreeCString(ctx, url);
+
+    fprintf(stderr, "[DEBUG] js_fetch: submitting fetch url=%s method=%s\n",
+            entry->url, entry->method ? entry->method : "GET");
+    fflush(stderr);
 
     /* Add to pending list */
     pthread_mutex_lock(&fm->mutex);

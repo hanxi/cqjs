@@ -353,14 +353,66 @@ JSValue cqjs_eval(JSContext *ctx, const char *input, size_t input_len,
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, BIG_STACK_SIZE);
 
-    if (pthread_create(&tid, &attr, big_stack_eval_thread, &ea) != 0) {
+    fprintf(stderr, "[DEBUG] cqjs_eval: creating big_stack thread for input_len=%zu\n", input_len);
+    fflush(stderr);
+    int rc = pthread_create(&tid, &attr, big_stack_eval_thread, &ea);
+    if (rc != 0) {
+        fprintf(stderr, "[WARN] cqjs_eval: pthread_create failed rc=%d, fallback to direct eval\n", rc);
+        fflush(stderr);
         pthread_attr_destroy(&attr);
         return JS_Eval(ctx, input, input_len, filename, eval_flags);
     }
     pthread_attr_destroy(&attr);
+    fprintf(stderr, "[DEBUG] cqjs_eval: waiting for big_stack thread\n");
+    fflush(stderr);
     pthread_join(tid, NULL);
+    fprintf(stderr, "[DEBUG] cqjs_eval: big_stack thread completed\n");
+    fflush(stderr);
     JS_UpdateStackTop(JS_GetRuntime(ctx));
     return ea.result;
+}
+
+/* ============================================================
+ * cqjs_eval_function — run JS_EvalFunction on a big-stack thread
+ *
+ * JS_EvalFunction executes compiled bytecode. For obfuscated code
+ * (e.g. jsjiami), execution can require very deep recursion that
+ * overflows the default thread stack. This wrapper runs it on a
+ * 64MB stack thread, just like cqjs_eval does for compilation.
+ * ============================================================ */
+
+typedef struct {
+    JSContext *ctx;
+    JSValue func_obj;  /* consumed by JS_EvalFunction */
+    JSValue result;
+} eval_func_args_t;
+
+static void *big_stack_eval_func_thread(void *arg) {
+    eval_func_args_t *efa = (eval_func_args_t *)arg;
+    JS_UpdateStackTop(JS_GetRuntime(efa->ctx));
+    efa->result = JS_EvalFunction(efa->ctx, efa->func_obj);
+    return NULL;
+}
+
+JSValue cqjs_eval_function(JSContext *ctx, JSValue func_obj) {
+    eval_func_args_t efa = {
+        .ctx = ctx,
+        .func_obj = func_obj,
+    };
+
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, BIG_STACK_SIZE);
+
+    if (pthread_create(&tid, &attr, big_stack_eval_func_thread, &efa) != 0) {
+        pthread_attr_destroy(&attr);
+        return JS_EvalFunction(ctx, func_obj);
+    }
+    pthread_attr_destroy(&attr);
+    pthread_join(tid, NULL);
+    JS_UpdateStackTop(JS_GetRuntime(ctx));
+    return efa.result;
 }
 
 JSValue cqjs_call(JSContext *ctx, JSValueConst func_obj,

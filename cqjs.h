@@ -166,6 +166,9 @@ void send_json_response(const char *id, const char *type,
 JSValue cqjs_eval(JSContext *ctx, const char *input, size_t input_len,
                   const char *filename, int eval_flags);
 
+/* Execute compiled bytecode (JS_EvalFunction) on a 64MB stack pthread */
+JSValue cqjs_eval_function(JSContext *ctx, JSValue func_obj);
+
 /* Call JS function on a 64MB stack pthread */
 JSValue cqjs_call(JSContext *ctx, JSValueConst func_obj,
                   JSValueConst this_obj, int argc, JSValueConst *argv);

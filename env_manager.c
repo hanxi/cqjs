@@ -27,9 +27,9 @@ static bytecode_cache_t *g_bc_cache = NULL;
 
 
 /* ============================================================
- * __goqjs_send bridge — per-environment version
+ * __cqjs_send bridge — per-environment version
  *
- * Each environment gets its own __goqjs_send that references
+ * Each environment gets its own __cqjs_send that references
  * its own dispatch_tracker via JS opaque data.
  * ============================================================ */
 
@@ -38,12 +38,13 @@ typedef struct {
     char *env_id;
 } env_bridge_data_t;
 
-static JSValue js_env_goqjs_send(JSContext *ctx, JSValueConst this_val,
+static JSValue js_env_cqjs_send(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv) {
     if (argc < 2) return JS_UNDEFINED;
 
     const char *event_name = JS_ToCString(ctx, argv[0]);
     const char *data_str = JS_ToCString(ctx, argv[1]);
+
     if (!event_name || !data_str) {
         if (event_name) JS_FreeCString(ctx, event_name);
         if (data_str) JS_FreeCString(ctx, data_str);
@@ -54,7 +55,7 @@ static JSValue js_env_goqjs_send(JSContext *ctx, JSValueConst this_val,
     env_bridge_data_t *bd = JS_GetContextOpaque(ctx);
 
     if (!bd) {
-        fprintf(stderr, "[ERROR] __goqjs_send: no bridge data on context, dropping event '%s'\n", event_name);
+        fprintf(stderr, "[ERROR] __cqjs_send: no bridge data on context, dropping event '%s'\n", event_name);
         JS_FreeCString(ctx, event_name);
         JS_FreeCString(ctx, data_str);
         return JS_UNDEFINED;
@@ -124,6 +125,8 @@ static JSValue js_env_goqjs_send(JSContext *ctx, JSValueConst this_val,
  * ============================================================ */
 
 static void env_process_jobs(js_env_t *env) {
+    fprintf(stderr, "[DEBUG] env_process_jobs [%s]: entering\n", env->env_id);
+    fflush(stderr);
     for (int i = 0; i < 100; i++) {
         JSContext *pctx = NULL;
         int executed = JS_ExecutePendingJob(env->runtime, &pctx);
@@ -137,7 +140,22 @@ static void env_process_jobs(js_env_t *env) {
         }
         int timer_processed = tm_process_pending(env->timer_mgr, env->context);
         int fetch_processed = fm_process_pending(env->fetch_mgr, env->context);
+        if (i == 0 || timer_processed || fetch_processed || executed > 0) {
+            fprintf(stderr, "[DEBUG] env_process_jobs [%s]: iter=%d executed=%d timer=%d fetch=%d\n",
+                    env->env_id, i, executed, timer_processed, fetch_processed);
+            fflush(stderr);
+        }
         if (executed <= 0 && !timer_processed && !fetch_processed)
+            break;
+
+        /* Yield to pending requests: if the request queue is non-empty,
+         * stop processing jobs so the event loop can dispatch them.
+         * This prevents repeating timers (setInterval) from starving
+         * incoming eval requests. */
+        pthread_mutex_lock(&env->request_mutex);
+        int has_pending_request = (env->request_head != NULL);
+        pthread_mutex_unlock(&env->request_mutex);
+        if (has_pending_request)
             break;
     }
 }
@@ -147,6 +165,10 @@ static void env_process_jobs(js_env_t *env) {
  * ============================================================ */
 
 static void env_handle_eval(js_env_t *env, env_request_t *req) {
+    fprintf(stderr, "[DEBUG] env_handle_eval: env=%s code_len=%zu filename=%s\n",
+            env->env_id, req->code ? strlen(req->code) : 0,
+            req->filename ? req->filename : "<null>");
+    fflush(stderr);
     if (!req->code) {
         send_json_response(req->request_id, "error", NULL,
                            NULL, 0, "eval: missing 'code'",
@@ -172,28 +194,44 @@ static void env_handle_eval(js_env_t *env, env_request_t *req) {
                 result = cqjs_eval(env->context, req->code, strlen(req->code),
                                    filename, JS_EVAL_TYPE_GLOBAL);
             } else {
-                result = JS_EvalFunction(env->context, obj);
+                result = cqjs_eval_function(env->context, obj);
             }
             fprintf(stderr, "[DEBUG] [%s] bytecode cache HIT for %s\n",
                     env->env_id, filename);
         } else {
-            /* Cache miss: compile, cache, execute */
-            JSValue compiled = JS_Eval(env->context, req->code, strlen(req->code),
-                                       filename,
-                                       JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+            /* Cache miss: compile on big stack, cache, execute */
+            fprintf(stderr, "[DEBUG] [%s] cache miss: compiling code_len=%zu\n",
+                    env->env_id, strlen(req->code));
+            fflush(stderr);
+            JSValue compiled = cqjs_eval(env->context, req->code, strlen(req->code),
+                                         filename,
+                                         JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+            fprintf(stderr, "[DEBUG] [%s] compile done, is_exception=%d\n",
+                    env->env_id, JS_IsException(compiled));
+            fflush(stderr);
             if (JS_IsException(compiled)) {
                 result = compiled;  /* propagate compile error */
             } else {
                 /* Serialize bytecode for caching */
+                fprintf(stderr, "[DEBUG] [%s] calling JS_WriteObject to serialize bytecode\n",
+                        env->env_id);
+                fflush(stderr);
                 size_t bc_len = 0;
                 uint8_t *bc_data = JS_WriteObject(env->context, &bc_len, compiled,
                                                    JS_WRITE_OBJ_BYTECODE);
+                fprintf(stderr, "[DEBUG] [%s] JS_WriteObject done, bc_len=%zu\n",
+                        env->env_id, bc_len);
+                fflush(stderr);
                 if (bc_data && bc_len > 0) {
                     bc_insert(g_bc_cache, hash, bc_data, bc_len);
                     js_free(env->context, bc_data);
                 }
                 /* Execute the compiled function */
-                result = JS_EvalFunction(env->context, compiled);
+                fprintf(stderr, "[DEBUG] [%s] calling cqjs_eval_function\n", env->env_id);
+                fflush(stderr);
+                result = cqjs_eval_function(env->context, compiled);
+                fprintf(stderr, "[DEBUG] [%s] cqjs_eval_function done\n", env->env_id);
+                fflush(stderr);
             }
             fprintf(stderr, "[DEBUG] [%s] bytecode cache MISS for %s\n",
                     env->env_id, filename);
@@ -209,6 +247,9 @@ static void env_handle_eval(js_env_t *env, env_request_t *req) {
     if (JS_IsException(result)) {
         JSValue exc = JS_GetException(env->context);
         const char *msg = JS_ToCString(env->context, exc);
+        fprintf(stderr, "[DEBUG] [%s] eval EXCEPTION: %s\n",
+                env->env_id, msg ? msg : "(null)");
+        fflush(stderr);
         send_json_response(req->request_id, "error", NULL,
                            NULL, 0, msg ? msg : "eval error",
                            NULL, NULL, 0);
@@ -216,6 +257,9 @@ static void env_handle_eval(js_env_t *env, env_request_t *req) {
         JS_FreeValue(env->context, exc);
     } else {
         const char *val_str = JS_ToCString(env->context, result);
+        fprintf(stderr, "[DEBUG] [%s] eval OK: result=%s\n",
+                env->env_id, val_str ? val_str : "(null)");
+        fflush(stderr);
         send_json_response(req->request_id, "result", NULL,
                            val_str, 0, NULL, NULL, NULL, 0);
         if (val_str) JS_FreeCString(env->context, val_str);
@@ -324,6 +368,9 @@ static void *env_event_loop(void *arg) {
             if (!req) break;
 
             /* Handle request */
+            fprintf(stderr, "[DEBUG] env_thread [%s]: dispatching type=%s\n",
+                    env->env_id, req->type);
+            fflush(stderr);
             if (strcmp(req->type, "eval") == 0) {
                 env_handle_eval(env, req);
             } else if (strcmp(req->type, "eval_file") == 0) {
@@ -485,19 +532,19 @@ js_env_t *env_create(env_manager_t *mgr, bytecode_cache_t *bc_cache,
     env->timer_mgr = env->polyfills->timer_mgr;
     env->fetch_mgr = env->polyfills->fetch_mgr;
 
-    /* Inject __goqjs_send bridge with per-env dispatch tracker */
+    /* Inject __cqjs_send bridge with per-env dispatch tracker */
     env_bridge_data_t *bd = calloc(1, sizeof(env_bridge_data_t));
     bd->dt = &env->dispatch_tracker;
     bd->env_id = env->env_id;  /* shares lifetime with env */
 
     JSValue global = JS_GetGlobalObject(env->context);
 
-    /* Store bridge data on the context for retrieval by __goqjs_send */
+    /* Store bridge data on the context for retrieval by __cqjs_send */
     JS_SetContextOpaque(env->context, bd);
 
-    /* Set __goqjs_send function */
-    JS_SetPropertyStr(env->context, global, "__goqjs_send",
-        JS_NewCFunction(env->context, js_env_goqjs_send, "__goqjs_send", 2));
+    /* Set __cqjs_send function */
+    JS_SetPropertyStr(env->context, global, "__cqjs_send",
+        JS_NewCFunction(env->context, js_env_cqjs_send, "__cqjs_send", 2));
 
     JS_FreeValue(env->context, global);
 

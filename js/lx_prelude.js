@@ -165,15 +165,15 @@ globalThis.lx = {
         };
     },
 
-    // Send event to Go side via __goqjs_send bridge function
+    // Send event to Go side via __cqjs_send bridge function
     send: function(eventName, data) {
         if (eventName === 'inited') {
             if (data && data.sources) {
                 _registeredSources = data.sources;
             }
         }
-        if (typeof __goqjs_send === 'function') {
-            __goqjs_send(eventName, JSON.stringify(data));
+        if (typeof __cqjs_send === 'function') {
+            __cqjs_send(eventName, JSON.stringify(data));
         }
     },
 
@@ -184,12 +184,13 @@ globalThis.lx = {
 
     // Dispatch event to registered handler (called from Go side via dispatch request).
     // The handler may return a Promise; the resolved/rejected value is sent back
-    // to Go via __goqjs_send('dispatchResult', ...) / __goqjs_send('dispatchError', ...).
+    // to Go via __cqjs_send('dispatchResult', ...) / __cqjs_send('dispatchError', ...).
+    // A 25-second timeout protects against handlers whose Promise never settles.
     _dispatch: function(requestId, eventName, data) {
         var handler = _eventHandlers.get(eventName);
         if (typeof handler !== 'function') {
-            if (typeof __goqjs_send === 'function') {
-                __goqjs_send('dispatchError', JSON.stringify({
+            if (typeof __cqjs_send === 'function') {
+                __cqjs_send('dispatchError', JSON.stringify({
                     id: requestId,
                     error: 'No handler registered for event: ' + eventName
                 }));
@@ -197,44 +198,54 @@ globalThis.lx = {
             return;
         }
 
-        try {
-            var result = handler(data);
+        var settled = false;
 
-            // If handler returns a Promise (thenable), await it
-            if (result && typeof result.then === 'function') {
-                result.then(function(value) {
-                    if (typeof __goqjs_send === 'function') {
-                        __goqjs_send('dispatchResult', JSON.stringify({
-                            id: requestId,
-                            result: value
-                        }));
-                    }
-                }).catch(function(err) {
-                    if (typeof __goqjs_send === 'function') {
-                        var errMsg = (err && err.message) ? err.message : String(err);
-                        __goqjs_send('dispatchError', JSON.stringify({
-                            id: requestId,
-                            error: errMsg
-                        }));
-                    }
-                });
-            } else {
-                // Synchronous result
-                if (typeof __goqjs_send === 'function') {
-                    __goqjs_send('dispatchResult', JSON.stringify({
-                        id: requestId,
-                        result: result
-                    }));
-                }
+        function sendResult(value) {
+            if (settled) return;
+            settled = true;
+            if (typeof __cqjs_send === 'function') {
+                __cqjs_send('dispatchResult', JSON.stringify({
+                    id: requestId,
+                    result: value
+                }));
             }
-        } catch (err) {
-            if (typeof __goqjs_send === 'function') {
+        }
+
+        function sendError(err) {
+            if (settled) return;
+            settled = true;
+            if (typeof __cqjs_send === 'function') {
                 var errMsg = (err && err.message) ? err.message : String(err);
-                __goqjs_send('dispatchError', JSON.stringify({
+                __cqjs_send('dispatchError', JSON.stringify({
                     id: requestId,
                     error: errMsg
                 }));
             }
+        }
+
+        try {
+            var result = handler(data);
+            var isThenable = (result && typeof result.then === 'function');
+
+            if (isThenable) {
+                // Guard against Promises that never settle (e.g. script bug on HTTP error)
+                // 8s is chosen to allow retries within the 30s WASM callback timeout
+                var timeoutId = setTimeout(function() {
+                    sendError(new Error('dispatch timeout: handler Promise did not settle within 8s'));
+                }, 8000);
+
+                result.then(function(value) {
+                    clearTimeout(timeoutId);
+                    sendResult(value);
+                }).catch(function(err) {
+                    clearTimeout(timeoutId);
+                    sendError(err);
+                });
+            } else {
+                sendResult(result);
+            }
+        } catch (err) {
+            sendError(err);
         }
     },
 

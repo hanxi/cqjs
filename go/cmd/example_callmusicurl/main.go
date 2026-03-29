@@ -20,9 +20,9 @@ func main() {
 	binPath := flag.String("bin", "./cqjs", "path to the cqjs binary")
 	scriptPath := flag.String("script", "", "path to the lx music source JS file")
 	preludePath := flag.String("prelude", "", "path to lx_prelude.js (sets up globalThis.lx)")
-	source := flag.String("source", "kw", "music source name (e.g. kw, kg, tx)")
-	quality := flag.String("quality", "128k", "audio quality (e.g. 128k, 320k, flac)")
-	songInfo := flag.String("song", `{"name":"晴天","singer":"周杰伦","songmid":"228908","rid":"228908"}`, "song info JSON")
+	source := flag.String("source", "wy", "music source name (e.g. kw, kg, tx)")
+	quality := flag.String("quality", "320k", "audio quality (e.g. 128k, 320k, flac)")
+	songInfo := flag.String("song", `{"name":"屋顶","singer":"周杰伦、温岚、吴宗宪","songmid":"5257138"}`, "song info JSON")
 	flag.Parse()
 
 	if *scriptPath == "" {

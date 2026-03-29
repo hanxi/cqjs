@@ -116,15 +116,42 @@ static char *stdin_reader_pop(stdin_reader_t *sr) {
 static void *stdin_reader_thread(void *arg) {
     stdin_reader_t *sr = (stdin_reader_t *)arg;
 
-    char buf[65536];
-    while (fgets(buf, sizeof(buf), stdin) != NULL) {
+    /* Dynamic line buffer to handle arbitrarily long JSON lines */
+    size_t buf_cap = 65536;
+    char *buf = malloc(buf_cap);
+    size_t buf_len = 0;
+
+    char chunk[65536];
+    while (fgets(chunk, sizeof(chunk), stdin) != NULL) {
+        size_t chunk_len = strlen(chunk);
+        /* Grow buffer if needed */
+        while (buf_len + chunk_len + 1 > buf_cap) {
+            buf_cap *= 2;
+            buf = realloc(buf, buf_cap);
+        }
+        memcpy(buf + buf_len, chunk, chunk_len);
+        buf_len += chunk_len;
+        buf[buf_len] = '\0';
+
+        /* Check if we have a complete line (ends with newline) */
+        if (buf_len == 0 || (buf[buf_len - 1] != '\n' && buf[buf_len - 1] != '\r')) {
+            /* Incomplete line, fgets stopped at buffer boundary; continue reading */
+            continue;
+        }
+
         /* Strip trailing newline */
-        size_t len = strlen(buf);
-        while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
-            buf[--len] = '\0';
-        if (len == 0) continue;
+        while (buf_len > 0 && (buf[buf_len - 1] == '\n' || buf[buf_len - 1] == '\r'))
+            buf[--buf_len] = '\0';
+        if (buf_len == 0) { buf_len = 0; continue; }
+        fprintf(stderr, "[DEBUG] stdin_reader: complete line len=%zu\n", buf_len);
+        fflush(stderr);
         stdin_reader_push(sr, strdup(buf));
+        buf_len = 0;
     }
+
+    fprintf(stderr, "[DEBUG] stdin_reader: EOF reached\n");
+    fflush(stderr);
+    free(buf);
 
     pthread_mutex_lock(&sr->mutex);
     sr->eof = 1;
@@ -168,8 +195,12 @@ static int64_t json_get_int64(JSContext *ctx, JSValue obj, const char *key, int6
 }
 
 static void handle_request(const char *line) {
+    size_t line_len = strlen(line);
+    fprintf(stderr, "[DEBUG] handle_request: received line len=%zu\n", line_len);
+    fflush(stderr);
+
     /* Parse JSON using lightweight context */
-    JSValue req = JS_ParseJSON(g_json_ctx, line, strlen(line), "<stdin>");
+    JSValue req = JS_ParseJSON(g_json_ctx, line, line_len, "<stdin>");
     if (JS_IsException(req)) {
         JSValue exc = JS_GetException(g_json_ctx);
         const char *msg = JS_ToCString(g_json_ctx, exc);
@@ -265,6 +296,8 @@ static void handle_request(const char *line) {
 
     } else if (strcmp(type, "eval") == 0) {
         char *env_id = json_get_string(g_json_ctx, req, "env_id");
+        fprintf(stderr, "[DEBUG] handle_request: eval env_id=%s\n", env_id ? env_id : "<null>");
+        fflush(stderr);
         if (!env_id) {
             send_json_response(id, "error", NULL,
                                NULL, 0, "eval: missing 'env_id'",
@@ -272,6 +305,9 @@ static void handle_request(const char *line) {
         } else {
             char *code = json_get_string(g_json_ctx, req, "code");
             char *filename = json_get_string(g_json_ctx, req, "filename");
+            fprintf(stderr, "[DEBUG] handle_request: eval code_len=%zu filename=%s\n",
+                    code ? strlen(code) : 0, filename ? filename : "<null>");
+            fflush(stderr);
 
             if (!code) {
                 send_json_response(id, "error", NULL,
@@ -289,6 +325,9 @@ static void handle_request(const char *line) {
                     send_json_response(id, "error", NULL,
                                        NULL, 0, errmsg, NULL, NULL, 0);
                 } else {
+                    fprintf(stderr, "[DEBUG] handle_request: submitting eval to env=%s code_len=%zu\n",
+                            env_id, strlen(code));
+                    fflush(stderr);
                     env_request_t *ereq = calloc(1, sizeof(env_request_t));
                     ereq->request_id = id ? strdup(id) : NULL;
                     ereq->type = strdup("eval");
